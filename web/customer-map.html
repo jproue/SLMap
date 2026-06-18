@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Customer Map</title>
+
+  <!-- Azure Maps SDK -->
+  <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css" />
+  <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: #f0f2f5;
+    }
+
+    /* ── Toolbar ── */
+    #toolbar {
+      background: #0078d4;
+      color: #fff;
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    #toolbar h1 { font-size: 14px; font-weight: 600; white-space: nowrap; }
+    .spacer { flex: 1; }
+
+    #search-box {
+      padding: 5px 10px;
+      border: none;
+      border-radius: 3px;
+      font-size: 13px;
+      width: 200px;
+      outline: none;
+    }
+
+    #status-badge {
+      font-size: 12px;
+      background: rgba(255,255,255,0.2);
+      padding: 3px 10px;
+      border-radius: 10px;
+      white-space: nowrap;
+    }
+
+    /* ── Map ── */
+    #map { flex: 1; width: 100%; }
+
+    /* ── Loading overlay ── */
+    #overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.52);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      z-index: 9999; color: #fff; gap: 14px;
+    }
+    #overlay.hidden { display: none; }
+    .spinner {
+      width: 40px; height: 40px;
+      border: 4px solid rgba(255,255,255,.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #overlay-msg { font-size: 14px; max-width: 300px; text-align: center; line-height: 1.5; }
+
+    /* ── Error banner ── */
+    #error-banner {
+      display: none;
+      background: #a4262c;
+      color: #fff;
+      padding: 8px 14px;
+      font-size: 13px;
+      flex-shrink: 0;
+    }
+    #error-banner.show { display: block; }
+
+    /* ── Popup ── */
+    .popup-content {
+      padding: 10px 13px;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      min-width: 180px;
+    }
+    .popup-content strong { display: block; font-size: 14px; color: #0078d4; margin-bottom: 2px; }
+    .popup-content .num { color: #666; font-size: 12px; }
+    .popup-content .addr { color: #333; margin-top: 4px; }
+  </style>
+</head>
+<body>
+
+<div id="overlay">
+  <div class="spinner"></div>
+  <div id="overlay-msg">Loading map…</div>
+</div>
+
+<div id="toolbar">
+  <h1>📍 Customer Locations</h1>
+  <div class="spacer"></div>
+  <input id="search-box" type="text" placeholder="Search customers…" />
+  <span id="status-badge">Waiting for data…</span>
+</div>
+
+<div id="error-banner"></div>
+<div id="map"></div>
+
+<script>
+/* ════════════════════════════════════════════
+   Globals
+════════════════════════════════════════════ */
+var azureMap = null;
+var datasource = null;
+var popup = null;
+var allFeatures = [];        // GeoJSON features for search filtering
+var subscriptionKey = '';
+var geocodeCache = {};
+var CACHE_KEY = 'az_customer_geocache';
+
+/* ════════════════════════════════════════════
+   1. Bootstrap — wait for key from Mongoose
+   The Azure Maps key arrives inside the
+   Map_ExportAllCustomers message payload.
+   Map is initialised lazily once the key
+   is received so we never need it in the URL.
+════════════════════════════════════════════ */
+window.addEventListener('load', function () {
+  // Load geocode cache from localStorage
+  try { geocodeCache = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}'); }
+  catch (e) { geocodeCache = {}; }
+
+  setOverlay('Waiting for data from SyteLine…');
+  signalReady();
+});
+
+/* ════════════════════════════════════════════
+   2. Initialise Azure Maps (called once key
+   is received in the first message)
+════════════════════════════════════════════ */
+function initMap() {
+  setOverlay('Initialising map…');
+  if (azureMap) return; // already initialised
+
+  azureMap = new atlas.Map('map', {
+    center: [0, 20],
+    zoom: 2,
+    language: 'en-US',
+    authOptions: {
+      authType: 'subscriptionKey',
+      subscriptionKey: subscriptionKey
+    }
+  });
+
+  azureMap.events.add('ready', function () {
+    // Datasource holds all customer points
+    datasource = new atlas.source.DataSource();
+    azureMap.sources.add(datasource);
+
+    // Symbol layer — blue dots
+    var symbolLayer = new atlas.layer.SymbolLayer(datasource, null, {
+      iconOptions: {
+        image: 'pin-blue',
+        anchor: 'bottom',
+        allowOverlap: false
+      },
+      textOptions: { textField: '', size: 0 }
+    });
+    azureMap.layers.add(symbolLayer);
+
+    // Bubble layer for clustering
+    datasource.setOptions({ cluster: true, clusterRadius: 50 });
+
+    var clusterBubbleLayer = new atlas.layer.BubbleLayer(datasource, null, {
+      filter: ['has', 'point_count'],
+      color: [
+        'step', ['get', 'point_count'],
+        '#0078d4', 10,
+        '#e67e22', 50,
+        '#a4262c'
+      ],
+      radius: ['step', ['get', 'point_count'], 16, 10, 22, 50, 30],
+      strokeWidth: 0,
+      blur: 0.1
+    });
+
+    var clusterCountLayer = new atlas.layer.SymbolLayer(datasource, null, {
+      filter: ['has', 'point_count'],
+      iconOptions: { image: 'none' },
+      textOptions: {
+        textField: [
+          'case',
+          ['>=', ['get', 'point_count'], 1000],
+          ['concat', ['to-string', ['/', ['get', 'point_count'], 1000]], 'k'],
+          ['to-string', ['get', 'point_count']]
+        ],
+        size: 12,
+        color: '#fff',
+        font: ['StandardFont-Bold']
+      }
+    });
+
+    azureMap.layers.add([clusterBubbleLayer, clusterCountLayer]);
+
+    // Popup
+    popup = new atlas.Popup({ pixelOffset: [0, -30], closeButton: true });
+
+    // Click single pin
+    azureMap.events.add('click', symbolLayer, function (e) {
+      if (e.shapes && e.shapes.length > 0) {
+        var props = e.shapes[0].getProperties();
+        showPopup(e.shapes[0].getCoordinates(), props);
+      }
+    });
+
+    // Click cluster → zoom in
+    azureMap.events.add('click', clusterBubbleLayer, function (e) {
+      if (e.shapes && e.shapes.length > 0) {
+        var cluster = e.shapes[0];
+        datasource.getClusterExpansionZoom(cluster.getProperties().cluster_id).then(function (z) {
+          azureMap.setCamera({ center: cluster.getCoordinates(), zoom: z });
+        });
+      }
+    });
+
+    // Search filter
+    document.getElementById('search-box').addEventListener('input', filterPins);
+
+    // Signal to the Mongoose parent form that the map is ready
+    // Mongoose listens for this event name and calls GenerateMapEvent() in VB
+    signalReady();
+  });
+}
+
+/* ════════════════════════════════════════════
+   3. Signal readiness to Mongoose parent
+════════════════════════════════════════════ */
+function signalReady() {
+
+  // Primary: Mongoose web control notification
+  try {
+    if (window.external && typeof window.external.notify === 'function') {
+      window.external.notify('GenerateMapEvent');
+    }
+  } catch (e) { /* not in Mongoose context */ }
+
+  // Fallback: postMessage to parent frame
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage('GenerateMapEvent', '*');
+    }
+  } catch (e) { /* cross-origin */ }
+}
+
+/* ════════════════════════════════════════════
+   4. Receive messages from Mongoose VB script
+      Format: "CommandName|JSONpayload"
+════════════════════════════════════════════ */
+window.addEventListener('message', function (event) {
+  handleMessage(event.data);
+});
+
+// Mongoose also calls this directly on the control in some versions
+window.InforPostMessage = function (msg) { handleMessage(msg); };
+
+function handleMessage(raw) {
+  if (!raw || typeof raw !== 'string') return;
+
+  var sep = raw.indexOf('|');
+  var command = sep === -1 ? raw : raw.substring(0, sep);
+  var payload = sep === -1 ? '' : raw.substring(sep + 1);
+
+  switch (command) {
+    case 'Map_ExportAllCustomers':
+      handleAllCustomers(payload);
+      break;
+    case 'Map_ExportSearch':
+      handleSingleSearch(payload);
+      break;
+    default:
+      // Unknown command — ignore
+      break;
+  }
+}
+
+/* ════════════════════════════════════════════
+   5. Handle all-customers data
+   Payload: { key: "...", customers: [...] }
+════════════════════════════════════════════ */
+async function handleAllCustomers(json) {
+  var payload;
+  try { payload = JSON.parse(json); }
+  catch (e) { showError('Invalid customer data received.'); hideOverlay(); return; }
+
+  // Extract key and initialise map if not already done
+  if (payload.key && !subscriptionKey) {
+    subscriptionKey = payload.key;
+    initMap();
+    // Wait for map ready event before plotting
+    await new Promise(function(resolve) {
+      if (azureMap) {
+        azureMap.events.add('ready', resolve);
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  if (!subscriptionKey) {
+    showError('No Azure Maps key received from SyteLine. Check the MapAPIKey in Service/General Parameters.');
+    hideOverlay();
+    return;
+  }
+
+  var customers = payload.customers || payload; // support both formats
+  if (!Array.isArray(customers) || customers.length === 0) {
+    setStatus('No customers with addresses found.');
+    hideOverlay();
+    return;
+  }
+
+  hideError();
+  setOverlay('Geocoding ' + customers.length + ' addresses…');
+
+  datasource.clear();
+  allFeatures = [];
+
+  var plotted = 0;
+  for (var i = 0; i < customers.length; i++) {
+    var c = customers[i];
+    var address = buildAddress(c);
+    if (!address) continue;
+
+    var coords = await geocodeAddress(address);
+    if (!coords) continue;
+
+    var feature = new atlas.data.Feature(
+      new atlas.data.Point(coords),
+      {
+        custNum: c.custNum || '',
+        name: c.name || '',
+        address: address,
+        label: (c.name || c.custNum || '').toLowerCase()
+      }
+    );
+
+    allFeatures.push(feature);
+    plotted++;
+
+    if (plotted % 20 === 0) {
+      setOverlay('Placing pins… (' + plotted + ' / ' + customers.length + ')');
+      datasource.add(allFeatures.slice()); // render incrementally
+    }
+  }
+
+  // Final render
+  datasource.clear();
+  datasource.add(allFeatures);
+
+  // Save cache
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(geocodeCache)); } catch (e) {}
+
+  setStatus(plotted + ' customers');
+  hideOverlay();
+}
+
+/* ════════════════════════════════════════════
+   6. Handle single address search (existing
+      Mongoose Map_ExportSearch behaviour)
+════════════════════════════════════════════ */
+async function handleSingleSearch(json) {
+  var data;
+  try { data = JSON.parse(json); }
+  catch (e) { return; }
+
+  var address = data.Address || '';
+  if (!address) return;
+
+  setOverlay('Locating address…');
+  var coords = await geocodeAddress(address);
+  if (coords) {
+    datasource.clear();
+    allFeatures = [];
+    var feature = new atlas.data.Feature(
+      new atlas.data.Point(coords),
+      { custNum: '', name: data.Name || '', address: address, label: (data.Name || '').toLowerCase() }
+    );
+    allFeatures.push(feature);
+    datasource.add(feature);
+    azureMap.setCamera({ center: coords, zoom: 14 });
+  }
+  hideOverlay();
+}
+
+/* ════════════════════════════════════════════
+   7. Geocoding via Azure Maps Search API
+════════════════════════════════════════════ */
+function buildAddress(c) {
+  return [c.addr1, c.addr2, c.city, c.state, c.zip, c.country]
+    .map(function (v) { return (v || '').trim(); })
+    .filter(Boolean)
+    .join(', ');
+}
+
+async function geocodeAddress(address) {
+  if (geocodeCache[address]) return geocodeCache[address];
+
+  try {
+    var url = 'https://atlas.microsoft.com/search/address/json'
+            + '?api-version=1.0'
+            + '&query=' + encodeURIComponent(address)
+            + '&limit=1'
+            + '&subscription-key=' + encodeURIComponent(subscriptionKey);
+
+    var resp = await fetch(url);
+    if (!resp.ok) return null;
+    var data = await resp.json();
+
+    if (data.results && data.results.length > 0) {
+      var pos = data.results[0].position;
+      var coords = [pos.lon, pos.lat]; // Azure Maps uses [lng, lat]
+      geocodeCache[address] = coords;
+      return coords;
+    }
+  } catch (e) { /* network error — skip this address */ }
+  return null;
+}
+
+/* ════════════════════════════════════════════
+   8. Popup
+════════════════════════════════════════════ */
+function showPopup(position, props) {
+  popup.setOptions({
+    position: position,
+    content: '<div class="popup-content">'
+           + '<strong>' + esc(props.name) + '</strong>'
+           + (props.custNum ? '<span class="num"># ' + esc(props.custNum) + '</span>' : '')
+           + '<div class="addr">' + esc(props.address) + '</div>'
+           + '</div>'
+  });
+  popup.open(azureMap);
+}
+
+/* ════════════════════════════════════════════
+   9. Search / filter
+════════════════════════════════════════════ */
+function filterPins() {
+  var q = document.getElementById('search-box').value.toLowerCase().trim();
+  if (!datasource) return;
+
+  datasource.clear();
+  var visible = q
+    ? allFeatures.filter(function (f) { return f.getProperties().label.includes(q); })
+    : allFeatures;
+
+  datasource.add(visible);
+  setStatus(q ? (visible.length + ' / ' + allFeatures.length + ' customers') : (allFeatures.length + ' customers'));
+}
+
+/* ════════════════════════════════════════════
+   10. UI helpers
+════════════════════════════════════════════ */
+function setOverlay(msg) {
+  document.getElementById('overlay-msg').textContent = msg;
+  document.getElementById('overlay').classList.remove('hidden');
+}
+function hideOverlay() {
+  document.getElementById('overlay').classList.add('hidden');
+}
+function setStatus(msg) {
+  document.getElementById('status-badge').textContent = msg;
+}
+function showError(msg) {
+  var el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function hideError() {
+  document.getElementById('error-banner').classList.remove('show');
+}
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+</script>
+
+</body>
+</html>
