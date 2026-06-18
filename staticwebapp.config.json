@@ -1,7 +1,5 @@
 {
-  "routes": [
-    {
-      "route": "/web"
-    }
-  ]
+  "navigationFallback": {
+    "rewrite": "/customer-map.html"
+  }
 }
