@@ -243,52 +243,40 @@ function initMap() {
 
 /* ════════════════════════════════════════════
    3. Signal readiness to Mongoose parent
+   Type 39 (WebBrowser) uses postMessage with
+   {MessageType, Payload} JSON format.
 ════════════════════════════════════════════ */
 function signalReady() {
-
-  // Primary: Mongoose web control notification
-  try {
-    if (window.external && typeof window.external.notify === 'function') {
-      window.external.notify('GenerateMapEvent');
-    }
-  } catch (e) { /* not in Mongoose context */ }
-
-  // Fallback: postMessage to parent frame
   try {
     if (window.parent && window.parent !== window) {
-      window.parent.postMessage('GenerateMapEvent', '*');
+      window.parent.postMessage(
+        JSON.stringify({ MessageType: 'MapReady', Payload: '' }),
+        '*'
+      );
     }
-  } catch (e) { /* cross-origin */ }
+  } catch (e) { /* standalone — no parent */ }
 }
 
 /* ════════════════════════════════════════════
    4. Receive messages from Mongoose VB script
-      Format: "CommandName|JSONpayload"
+   Type 39 format: {MessageType, Payload}
+   where Payload is the JSON string set in
+   Map_CustomerData variable.
 ════════════════════════════════════════════ */
 window.addEventListener('message', function (event) {
   handleMessage(event.data);
 });
 
-// Mongoose also calls this directly on the control in some versions
-window.InforPostMessage = function (msg) { handleMessage(msg); };
-
 function handleMessage(raw) {
-  if (!raw || typeof raw !== 'string') return;
+  if (!raw) return;
 
-  var sep = raw.indexOf('|');
-  var command = sep === -1 ? raw : raw.substring(0, sep);
-  var payload = sep === -1 ? '' : raw.substring(sep + 1);
+  var msg;
+  try {
+    msg = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+  } catch (e) { return; }
 
-  switch (command) {
-    case 'Map_ExportAllCustomers':
-      handleAllCustomers(payload);
-      break;
-    case 'Map_ExportSearch':
-      handleSingleSearch(payload);
-      break;
-    default:
-      // Unknown command — ignore
-      break;
+  if (msg.MessageType === 'MapData') {
+    handleAllCustomers(msg.Payload);
   }
 }
 
